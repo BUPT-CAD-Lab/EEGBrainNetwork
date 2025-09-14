@@ -84,11 +84,7 @@ We use two publicly available EEG datasets widely used in affective computing:
 Run training with the following command (customize parameters as needed):
 
 ```bash
-CUDA_VISIBLE_DEVICES=6 python main.py \
-    --data='FACED' --loss='sce' --graph='base' --batch=11 --limit=1 \
-    --seed=74 --valpage=6 --kfold=10 --maxiter=5000 --lr=0.00005 \
-    --alpha=0.0008 --norm=1 --freq='BH' --ckpoint=0 --tylabel='Arousal' \
-    --modeldir=10 --ablation=1 &
+CUDA_VISIBLE_DEVICES=6 python main.py
 ```
 
 ✅ **Tip:** You can adjust `--CUDA_VISIBLE_DEVICES` to the GPU index you want to use, and modify other flags to switch datasets, loss functions, graph types, and ablation settings.
@@ -119,11 +115,6 @@ All experiments were conducted on an **NVIDIA A40 GPU server** with **Intel(R) X
 | `--graph` | Graph type (`base`, others) | `'base'` |
 | `--batch` | Batch size | `11` |
 | `--maxiter` | Max iterations | `5000` |
-| `--kfold` | K-fold cross-validation splits | `10` |
-| `--lr` | Learning rate | `0.00005` |
-| `--alpha` | Weight decay (regularization) | `0.0008` |
-| `--tylabel` | Label type (`Arousal`, `Valence`) | `'Arousal'` |
-| `--ablation` | Whether to run ablation study (`0` or `1`) | `1` |
 
 ### 💾 Intermediate Saves
 
