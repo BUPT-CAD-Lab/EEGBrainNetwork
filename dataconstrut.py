@@ -1,248 +1,343 @@
-import _pickle as cPickle
+# -*- coding: utf-8 -*-
+import os
+import pickle
 import numpy as np
 import torch
-import os
+from dataclasses import dataclass
+from typing import Tuple, List
 from scipy.signal import stft
-from torch_geometric.data import Data
-from torch_geometric.data import Dataset
-from torch_geometric.data import Batch
-import torch.nn.functional as F
-import pickle
 
-# Function to load data from each participant file
-def read_eeg_signal_from_file(filename):
-    x = pickle._Unpickler(open(filename, 'rb'))
-    x.encoding = 'latin1'
-    p = x.load()
-    return p
+# =========================
+# 配置区（按需修改）
+# =========================
+@dataclass
+class Config:
+    sample_rate: int = 128
+    baseline_sec: int = 3          # 基线时长（秒）
+    total_sec: int = 60            # 有效数据时长（秒）
+    window_sec: int = 3            # 分窗大小（秒）
+    step_sec: int = 2              # 分窗步长（秒）
+    stft_win_sec: float = 2.0      # STFT 窗长（秒）
+    stft_overlap_ratio: float = 0.5
+    stft_nfft: int = None          # None → 使用 nperseg
+    harmonic_order: int = 8        # 2-9 次谐波（共 8 个）
+    min_band_width_hz: float = 2.0 # 频带最小带宽（Hz）
+    label_dim: int = 0             # DEAP 标签维度（0:valence, 1:arousal, 2:dominance, 3:liking）
+    label_threshold: float = 5.0   # DEAP 二值阈值
+    out_dir: str = "./eegall/data/DEAP"   # 输出根目录
+    raw_dir: str = "./DEAP/data_preprocessed_python/data_preprocessed_python/raw"  # 原始 pickle 路径
 
-def data_calibrate(data):
+CFG = Config()
+
+# =========================
+# 工具函数
+# =========================
+def read_eeg_signal_from_file(filename: str):
+    with open(filename, "rb") as f:
+        x = pickle._Unpickler(f)
+        x.encoding = "latin1"
+        p = x.load()
+    return p  # dict, keys: 'data' (40x40x8064?) in DEAP原数据; 这里假设外部已转成 (channels, time)
+
+def data_calibrate(data: np.ndarray, sample_rate: int, baseline_sec: int) -> np.ndarray:
     """
-    数据标定
-    :param data: 原始数据
-    :return: 标定后的数据
+    基线抵消（可选）：把 first baseline_sec 作为基线，重复拼到 total_sec 再相减。
+    若不需要抵消，将最后一行注释的相减替换为直接 return normal_data。
+    输入 data 形状: (channels, total_len)
     """
-    fs = 128
-    baseline_time = 3  # 基线数据的时间长度
-    # 将 3s 基线时间与 60s 数据分开
-    baseline_data, normal_data = np.split(data, [baseline_time * fs], axis=-1)
-    # 将基线数据重复 20 次，补成 60s
-    baseline_data = np.concatenate([baseline_data] * 20, axis=-1)
-    # 用 60s 数据减去基线数据，去除噪声
-    return normal_data
-    # return normal_data - baseline_data
+    fs = sample_rate
+    baseline_len = baseline_sec * fs
+    baseline_data, normal_data = np.split(data, [baseline_len], axis=-1)
+    # 把 baseline 拉到与 normal_data 同长度（按时间重复）
+    reps = int(np.ceil(normal_data.shape[-1] / baseline_data.shape[-1]))
+    baseline_tiled = np.tile(baseline_data, reps)[:, :normal_data.shape[-1]]
+    # 如需启用基线抵消，使用下面一行；如果不需要，就返回 normal_data
+    return normal_data - baseline_tiled
+    # return normal_data
 
-def set_label(labels):
+def set_label(labels: np.ndarray, dim: int = 0, threshold: float = 5.0) -> int:
     """
-    打标签
-    :param labels: 标签
-    :return: 处理后的标签
+    labels: (40, 4) for DEAP，每个 trial 的 4 维评分。
+    返回二值标签（单一维度），int 0/1。
     """
-    return torch.tensor(np.where(labels < 5, 0, 1), dtype=torch.long)  # 小于 5 的元素改为 0，大于等于 5 的改为 1
+    if labels.ndim == 1:
+        score = labels[dim]
+    else:
+        score = labels[:, dim].mean() if labels.shape[0] == 40 else labels[dim]
+    return int(0 if score < threshold else 1)
 
-def data_divide(data, label):
+def data_divide(data: np.ndarray, fs: int, window_sec: int, step_sec: int) -> np.ndarray:
     """
-    数据分割
-    :param data: 标定后的数据
-    :param label: 标签
-    :return: 分割后的数据和标签
+    输入:
+        data: (channels, time)
+    输出:
+        segments: (num_segments, channels, window_len)
     """
-    fs = 128
-    window_size = 3  # 窗口大小
-    step = 2  # 窗口滑动的步长
-    num = (60 - window_size) // step + 1  # 分割成的段数
+    C, T = data.shape
+    w = window_sec * fs
+    s = step_sec * fs
+    starts = np.arange(0, T - w + 1, s, dtype=int)
+    segments = np.stack([data[:, i:i + w] for i in starts], axis=0)  # (S, C, w)
+    return segments
 
-    divided_data = []
-    for i in range(0, num * step, step):
-        segment = data[:, :, i * fs: (i + window_size) * fs]
-        divided_data.append(segment)
-    divided_data = np.vstack(divided_data)
+def nearest_idx(arr: np.ndarray, val: float) -> int:
+    return int(np.argmin(np.abs(arr - val)))
 
-    divided_label = np.vstack([label] * num)
-
-    return divided_data, divided_label
-
-def calculate_de(psd):
+def calculate_de(psd: np.ndarray) -> np.ndarray:
+    """
+    Differential Entropy: 0.5 * log(2πeσ^2)
+    psd 形状: (..., F_band, T_frames)
+    返回: (..., T_frames)
+    """
     variance = np.var(psd, axis=-2, ddof=1) + 1e-5
     de = 0.5 * np.log(2 * np.pi * np.e * variance)
     return de
 
-def base_homo_select(eeg_data,sample_rate,num_exp, num_channel):
-    signal = eeg_data
+def base_homo_select(
+    eeg_segments: np.ndarray,
+    sample_rate: int,
+    num_channel: int,
+    order: int
+):
+    """
+    输入:
+        eeg_segments: (S, C, win_len)
+    输出:
+        base_freq: (S, C) 每段每通道基频（由频谱最大值求取后再对时间帧平均）
+        f: (F,) 频率网格
+        harm_freq: (S, C, order) 每段每通道的 2..(order+1) 次谐波频率(就近对齐到 f)
+        zxx: (S, C, F, T_frames) 复谱
+    """
     fs = sample_rate
-    order = 8
-    f, t, zxx = stft(signal, fs=128, window='hann', nperseg=64, noverlap=0, nfft=256, scaling='psd')
-    power = np.power(np.abs(zxx),2)
-    base_freq_idx = np.abs(power).argmax(axis=2)
-    base_freq = np.mean(f[base_freq_idx], axis=-1)
-    length = base_freq.shape[0]
-    # 找到谐波
-    harm_freq = np.empty((length, num_channel, order))
-    for i in range(length):
-        for j in range(num_channel):
-            base_f = base_freq[i][j]
-            for k in range(8):
-                harmonic_f = base_f*(k+2)
-                harmonic_idx = np.argmin(np.abs(f-harmonic_f))
-                harm_freq[i,j,k] = f[harmonic_idx]
-    
-    # Base Freq
-    print(f"Base freq for every channel and every second: {base_freq.shape}")
-    # Harmonic Freq
-    print(f"Harmonic freq for every second and every channel, and with 2-9 order harmonic freq: {harm_freq.shape}")
+    nperseg = int(round(CFG.stft_win_sec * fs))
+    noverlap = int(round(CFG.stft_overlap_ratio * nperseg))
+    nfft = CFG.stft_nfft or nperseg
+
+    # scipy.signal.stft 会沿最后一个轴做 STFT；N-D 输入会广播其它轴
+    f, t, zxx = stft(
+        eeg_segments, fs=fs, window='hann',
+        nperseg=nperseg, noverlap=noverlap, nfft=nfft, axis=-1, padded=False, boundary=None
+    )
+    # 现在 zxx 形状：(S, C, F, T_frames)
+    power = np.abs(zxx) ** 2
+    # 频率轴为 -2，时间帧为 -1
+    base_freq_idx = power.argmax(axis=-2)     # (S, C, T_frames) → 每帧的最强频点
+    # 对时间帧取平均，得到每段每通道一个基频
+    base_freq = f.take(base_freq_idx, mode='clip').mean(axis=-1)  # (S, C)
+
+    # 谐波频率（对齐到 f 网格最近邻）
+    harm_freq = np.zeros((eeg_segments.shape[0], num_channel, order), dtype=float)
+    for s in range(eeg_segments.shape[0]):
+        for ch in range(num_channel):
+            bf = base_freq[s, ch]
+            for k in range(order):  # 2..(order+1) 次
+                harmonic_f = (k + 2) * bf
+                harm_freq[s, ch, k] = f[nearest_idx(f, harmonic_f)]
     return base_freq, f, harm_freq, zxx
 
-def feature_extract(base_freq, f, harm_freq, zxx):
-    # Total withoud distinguish base freq and hramonic freq
-    power = np.power(np.abs(zxx),2)
-    channel_num = base_freq.shape[-1]
+def feature_extract(
+    base_freq: np.ndarray, f: np.ndarray, harm_freq: np.ndarray, zxx: np.ndarray
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    输入:
+        base_freq: (S, C)
+        f: (F,)
+        harm_freq: (S, C, order)
+        zxx: (S, C, F, T_frames)
+    输出:
+        base_de_features: (S, C, T_frames)
+        harmon_de_features: (S, C, T_frames)
+    """
+    power = np.abs(zxx) ** 2
+    S, C, F, T_frames = power.shape
     alpha = 1e-5
 
-    # Find the range of base freq for every channel
-    base_flow_list = []
-    base_fhigh_list = []
-    for i in range(channel_num):
-        std = np.std(base_freq[:,i])
-        mean = np.mean(base_freq[:,i])
-        fhigh = int(mean+std)
-        flow = int(mean-std)
-        base_flow_list.append(flow)
-        base_fhigh_list.append(fhigh)
+    # 对各通道统计区间（稳健一些）
+    harm_mean = harm_freq.mean(axis=-1)  # (S, C) → 对谐波序求平均
+    base_de_list: List[np.ndarray] = []
+    harm_de_list: List[np.ndarray] = []
 
-    # sepfreq = np.max(base_fhigh_list)
-    # print(f"Channel:{i} Sep freq: {sepfreq}")
-    harm_flow_list = []
-    harm_fhigh_list = []
-    harm_freq = np.mean(harm_freq, axis=-1)
-    for i in range(channel_num):
-        std = np.std(harm_freq[:,i])
-        mean = np.mean(harm_freq[:,i])
-        fhigh = int(mean + std)
-        flow = int(mean - std)
-        harm_flow_list.append(flow)
-        harm_fhigh_list.append(fhigh)
-    # Base
-    base_de_features = []
-    harmon_de_features = []
-    for i in range(channel_num):
-        base_flow = base_flow_list[i]
-        base_fhigh = base_fhigh_list[i]
-        if base_flow < 0.5:
-            base_flow = 0.5
-        if base_fhigh < base_flow or np.abs(base_fhigh - base_flow)<2:
-            base_fhigh = base_flow + 4
-        if base_fhigh > max(f):
-            base_fhigh = max(f) // 2
-        
-        index1 = np.where(f == base_flow)[0][0]
-        index2 = np.where(f == base_fhigh)[0][0]
-        # if index1 > index2:
-        #     print(f"Channel:{i} index1:{index1}, index2:{index2}, base_fhigh:{base_fhigh},base_flow:{base_flow}")
-        #     break
-        psd = power[:,i,index1:index2,:]+alpha
-        base_de = calculate_de(psd)
-        base_de_features.append(base_de)
-        print(f"Base: Channel:{i} freq: max:{base_fhigh}min:{base_flow}")
+    f_min, f_max = float(f.min()), float(f.max())
 
-        ### Harm part
-        harm_flow = harm_flow_list[i]
-        harm_fhigh = harm_fhigh_list[i]
-        
-        if harm_flow < base_fhigh or harm_flow == 0:
-            harm_flow = base_fhigh
-            if harm_fhigh < harm_flow:
-                harm_fhigh = harm_flow + 4
-        if np.abs(harm_fhigh-harm_flow) < 2:
-            harm_fhigh = harm_flow + 5
-        if harm_fhigh > max(f):
-            harm_fhigh = max(f)
-        
-        index1 = np.where(f == harm_flow)[0][0]
-        index2 = np.where(f == harm_fhigh)[0][0]
-        psd = power[:,i,index1:index2,:]+alpha
-        harm_de = calculate_de(psd)
-        harmon_de_features.append(harm_de)
-        print(f"Harmon: Channel:{i} freq: max:{harm_fhigh} min:{harm_flow}")
-    base_de_features = np.array(base_de_features)
-    base_de_features = np.transpose(base_de_features, (1,0,2))
-    # print(f"base_de :{base_de_features.shape}")
-    harmon_de_features = np.array(harmon_de_features)
-    # print(f"harm_de : {harmon_de_features.shape}")
-    harmon_de_features = np.transpose(harmon_de_features,(1,0,2))
+    for ch in range(C):
+        mu_b, sd_b = float(base_freq[:, ch].mean()), float(base_freq[:, ch].std())
+        mu_h, sd_h = float(harm_mean[:, ch].mean()), float(harm_mean[:, ch].std())
 
-    print(f"Created Base And Harmon Features with shape: {base_de_features.shape} BASE:max:{np.max(base_freq)}min:{np.min(base_freq)} Harm:max:{np.max(harm_freq)}min:{np.min(harm_freq)}")
+        # base 频带
+        base_low = max(0.5, mu_b - sd_b)
+        base_high = min(f_max, max(base_low + CFG.min_band_width_hz, mu_b + sd_b))
+
+        # harmonic 频带（不与 base 重叠）
+        harm_low = max(base_high, mu_h - sd_h)
+        harm_high = min(f_max, max(harm_low + CFG.min_band_width_hz, mu_h + sd_h))
+
+        # 最近邻索引，并确保 i1 < i2
+        i1, i2 = sorted([nearest_idx(f, base_low), nearest_idx(f, base_high)])
+        if i1 == i2:
+            i2 = min(i1 + 1, len(f) - 1)
+            i1 = max(0, i2 - 1)
+
+        j1, j2 = sorted([nearest_idx(f, harm_low), nearest_idx(f, harm_high)])
+        if j1 == j2:
+            j2 = min(j1 + 1, len(f) - 1)
+            j1 = max(0, j2 - 1)
+
+        psd_b = power[:, ch, i1:i2 + 1, :] + alpha  # (S, F_b, T)
+        psd_h = power[:, ch, j1:j2 + 1, :] + alpha
+
+        de_b = calculate_de(psd_b)  # (S, T)
+        de_h = calculate_de(psd_h)  # (S, T)
+
+        base_de_list.append(de_b)   # 通道维累积
+        harm_de_list.append(de_h)
+
+        print(f"[Ch {ch:02d}] Base [{f[i1]:.2f},{f[i2]:.2f}] Hz | Harm [{f[j1]:.2f},{f[j2]:.2f}] Hz")
+
+    # 组装回 (S, C, T)
+    base_de_features = np.transpose(np.array(base_de_list), (1, 0, 2))
+    harmon_de_features = np.transpose(np.array(harm_de_list), (1, 0, 2))
+
+    # 形状断言
+    assert base_de_features.shape == (S, C, T_frames)
+    assert harmon_de_features.shape == (S, C, T_frames)
+
+    print(f"[Feature] Base/Harm DE shape: {base_de_features.shape}")
     return base_de_features, harmon_de_features
 
-def data_process(data,sample_rate,exp_num,channel_num,time,labels):
-    data = data_calibrate(data)
-    # print(data.shape)
-    data, labels = data_divide(data, labels)
-    # print(f"labels shape:{labels}")
-    base_freq, f, harm_freq, zxx = base_homo_select(data,sample_rate,exp_num, channel_num)
-    base_de_features, harmon_de_features = feature_extract(base_freq, f, harm_freq, zxx)
-    labels = set_label(labels)
-    # print(f"labels:{labels}")
-    return base_de_features, harmon_de_features, labels
+def phase_sync(de_feat: np.ndarray) -> np.ndarray:
+    """
+    标准 PLV 相位同步
+    输入:
+        de_feat: (C, T_feat)
+    输出:
+        M: (C, C) ∈ [0,1]
+    """
+    C, T = de_feat.shape
+    M = np.zeros((C, C), dtype=float)
+    # PLV: abs(mean(exp(1j * phase_diff)))
+    for i in range(C):
+        M[i, i] = 1.0
+        for j in range(i + 1, C):
+            phase_diff = np.angle(np.exp(1j * (de_feat[i] - de_feat[j])))
+            plv = np.abs(np.mean(np.exp(1j * phase_diff)))
+            M[i, j] = M[j, i] = plv
+    return M
 
-# X (32, 760, 40, 7) ; 32主体，每个主体有760(19*40)个样本，40个通道，7s构成向量
-def phase_sync(de_features):
-    n_channels, n_samples = de_features.shape
-    phase_sync_matrix = np.zeros((n_channels, n_channels))
-    alpha = 1e-5
-    for i in range(n_channels):
-        for j in range(i+1, n_channels):
-            phase_diff = np.angle(np.exp(1j * (de_features[i] - de_features[j])))
-            imag = np.abs(np.mean(np.exp(1j * phase_diff)).imag)
-            # 计算相位相似度
-            phase_sync_matrix[i, j] = np.log(imag+alpha) / np.log(0.5)
-    return phase_sync_matrix
+def phase_graph(base_features: torch.Tensor, harm_features: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    输入:
+        base_features: (subjects, segments, channels, T_feat) torch
+        harm_features: 同上
+    输出:
+        base_graph, harm_graph: (subjects, segments, channels, channels) torch
+    """
+    base = base_features.detach().cpu().numpy()
+    harm = harm_features.detach().cpu().numpy()
+    Sbj, Seg, C, T = base.shape
+    base_graph = np.empty((Sbj, Seg, C, C), dtype=float)
+    harm_graph = np.empty_like(base_graph)
 
-# get the graph adjacency matrix by phase sync for base and harm signal
-def phase_graph(base_features, harm_features):
-    num_subject, num_sample, num_channel, seconds = base_features.shape
-    base_graph = np.empty((num_subject,num_sample,num_channel,num_channel))
-    harm_graph = np.empty((num_subject,num_sample,num_channel,num_channel))
-    for i in range(num_subject):
-        for j in range(num_sample):
-            base_psy = phase_sync(base_features[i][j])
-            harm_psy = phase_sync(harm_features[i][j])
-            base_graph[i][j] = base_psy
-            harm_graph[i][j] = harm_psy
-    return base_graph, harm_graph
+    for s in range(Sbj):
+        for k in range(Seg):
+            base_graph[s, k] = phase_sync(base[s, k])  # (C, T) → (C, C)
+            harm_graph[s, k] = phase_sync(harm[s, k])
 
-if __name__ == '__main__':
-    sample_rate = 128
-    exp_num = 40
-    channel_num = 40
-    time = 60
+    return torch.from_numpy(base_graph), torch.from_numpy(harm_graph)
 
-    raw_dir = "/DEAP/data_preprocessed_python/data_preprocessed_python/raw/"
-    file_names = os.listdir(raw_dir)
-    all_base_de_features = []
-    all_harmon_de_features = []
-    all_labels = []
+def ensure_dir(path: str):
+    os.makedirs(path, exist_ok=True)
+
+# =========================
+# 主流程（逐被试处理并汇总）
+# =========================
+def process_one_subject(trial: dict, cfg: Config) -> Tuple[np.ndarray, np.ndarray, int]:
+    """
+    输入 trial: {'data': np.ndarray, 'labels': np.ndarray}
+    返回:
+        base_de_features: (segments, channels, T_feat)
+        harmon_de_features: (segments, channels, T_feat)
+        y: int (0/1)
+    """
+    data = trial['data']  # 期望: (channels, time)
+    labels = trial['labels']  # 期望: (40, 4) 或 (4,)
+    fs = cfg.sample_rate
+
+    # 1) 基线标定
+    data = data_calibrate(data, fs, cfg.baseline_sec)  # → (channels, total_len)
+
+    # 2) 分窗
+    segments = data_divide(data, fs, cfg.window_sec, cfg.step_sec)  # (S, C, w)
+    num_segments, num_channels, win_len = segments.shape
+    assert num_channels == data.shape[0], "通道数不一致"
+    print(f"[Divide] segments={num_segments}, channels={num_channels}, win_len={win_len}")
+
+    # 3) STFT & 基频/谐波
+    base_freq, f, harm_freq, zxx = base_homo_select(
+        segments, sample_rate=fs, num_channel=num_channels, order=cfg.harmonic_order
+    )
+
+    # 4) 提取 DE 特征
+    base_de, harm_de = feature_extract(base_freq, f, harm_freq, zxx)  # (S, C, T_feat)
+
+    # 5) 标签（对当前 trial 的所有分段共用同一标签）
+    y = set_label(np.asarray(labels), dim=cfg.label_dim, threshold=cfg.label_threshold)  # int 0/1
+
+    return base_de, harm_de, y
+
+def main():
+    cfg = CFG
+    ensure_dir(cfg.out_dir)
+
+    file_names = sorted(os.listdir(cfg.raw_dir))
+    all_base_de_features: List[torch.Tensor] = []
+    all_harmon_de_features: List[torch.Tensor] = []
+    all_labels_per_subject: List[torch.Tensor] = []
+
     for filename in file_names:
-        filepath = "/DEAP/data_preprocessed_python/data_preprocessed_python/raw/"+str(filename)
+        filepath = os.path.join(cfg.raw_dir, filename)
+        if not os.path.isfile(filepath) or not filename.endswith(".dat"):
+            # 兼容不同扩展名；若你的原始文件不是 .dat，请去掉此判断
+            # 也可以直接处理所有文件名
+            pass
+        print(f"\n******* Processing {filename} *******")
         trial = read_eeg_signal_from_file(filepath)
-        data = trial['data']
-        labels = trial['labels']
-        print(f"******* Processing on file {filename} ********")
-        base_de_features, harmon_de_features, labels = data_process(data,sample_rate,exp_num,channel_num,time,labels)
-        
-        all_base_de_features.append(base_de_features)
-        all_harmon_de_features.append(harmon_de_features)
-        all_labels.append(labels)
-        # 做到这步之后，保存三个all的变量就行了
 
+        base_de, harm_de, y = process_one_subject(trial, cfg)
+        # 堆叠到 torch： (segments, channels, T_feat)
+        base_de_t = torch.from_numpy(base_de).float()
+        harm_de_t = torch.from_numpy(harm_de).float()
 
-    all_base_de_features = torch.tensor(all_base_de_features)
-    all_harmon_de_features = torch.tensor(all_harmon_de_features)
-    all_labels=torch.stack(all_labels)
+        # 统一到 (1, segments, channels, T_feat) 以便最终 cat
+        all_base_de_features.append(base_de_t.unsqueeze(0))
+        all_harmon_de_features.append(harm_de_t.unsqueeze(0))
 
-    torch.save(all_base_de_features,'/eegall/data/DEAP/all_ori13base_de_features.pt')
-    torch.save(all_harmon_de_features,'eegall/data/DEAP/all_ori13harmon_de_features.pt')
-    torch.save(all_labels,'/eegall/data/DEAP/all_ori13labels.pt')
+        # per-segment labels（每个 segment 一个相同的标签），形状 (segments,)
+        seg = base_de.shape[0]
+        labels_t = torch.full((seg,), int(y), dtype=torch.long)
+        all_labels_per_subject.append(labels_t.unsqueeze(0))  # (1, segments)
 
+    # 汇总：subjects 维度
+    all_base_de_features = torch.cat(all_base_de_features, dim=0)    # (subjects, segments, channels, T_feat)
+    all_harmon_de_features = torch.cat(all_harmon_de_features, dim=0)
+    all_labels = torch.cat(all_labels_per_subject, dim=0)            # (subjects, segments)
+
+    print("\n=== Final Shapes ===")
+    print("Base DE: ", tuple(all_base_de_features.shape))
+    print("Harm DE: ", tuple(all_harmon_de_features.shape))
+    print("Labels : ", tuple(all_labels.shape))
+
+    # 保存特征与标签
+    ensure_dir(cfg.out_dir)
+    torch.save(all_base_de_features, os.path.join(cfg.out_dir, "all_base_de_features.pt"))
+    torch.save(all_harmon_de_features, os.path.join(cfg.out_dir, "all_harmon_de_features.pt"))
+    torch.save(all_labels, os.path.join(cfg.out_dir, "all_labels.pt"))
+
+    # 计算图（PLV 相位同步）
     base_graph, harm_graph = phase_graph(all_base_de_features, all_harmon_de_features)
-    torch.save(base_graph,'/eegall/data/DEAP/ori13base_graph.pt')
-    torch.save(harm_graph,'/eegall/data/DEAP/ori13harm_graph.pt')
+    torch.save(base_graph, os.path.join(cfg.out_dir, "base_graph.pt"))
+    torch.save(harm_graph, os.path.join(cfg.out_dir, "harm_graph.pt"))
+
+    print(f"\nSaved to {cfg.out_dir}")
+
+if __name__ == "__main__":
+    main()
